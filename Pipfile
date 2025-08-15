@@ -1,0 +1,25 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+pdfplumber = "*"
+pandas = "*"
+langchain = "*"
+langchain-community = "*"
+rapidocr-onnxruntime = "*"
+tabulate = "*"
+langchain-google-genai = "*"
+python-dotenv = "*"
+langchain-openai = "*"
+faiss-cpu = "*"
+docx2txt = "*"
+haystack-ai = "*"
+sentence-transformers = "*"
+pillow = "*"
+
+[dev-packages]
+
+[requires]
+python_version = "3.11"
