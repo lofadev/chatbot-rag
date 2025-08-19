@@ -1,11 +1,14 @@
 import os
 import shutil
 import gradio as gr
-from langchain.document_loaders import PyMuPDFLoader, Docx2txtLoader, TextLoader
+from langchain_community.document_loaders import (
+    PyMuPDFLoader,
+    Docx2txtLoader,
+    TextLoader,
+)
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.vectorstores import FAISS
-from langchain_openai import ChatOpenAI
+from langchain_community.vectorstores import FAISS
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.prompts import PromptTemplate
 from dotenv import load_dotenv
 
@@ -32,130 +35,363 @@ DEFAULT_CONFIG = {
 
 # Hàm lấy loader phù hợp dựa trên phần mở rộng của file
 def get_loader(file_path):
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext == ".pdf":
-        return PyMuPDFLoader(file_path, extract_tables="markdown", mode="page")
-    elif ext == ".docx":
-        return Docx2txtLoader(file_path)
-    elif ext in [".txt", ".md"]:
-        return TextLoader(file_path)
-    else:
-        raise ValueError("Unsupported file format")
+    try:
+        # Kiểm tra file tồn tại
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Không tìm thấy file: {file_path}")
+
+        # Kiểm tra file có thể đọc được
+        if not os.access(file_path, os.R_OK):
+            raise PermissionError(f"Không có quyền đọc file: {file_path}")
+
+        ext = os.path.splitext(file_path)[1].lower()
+
+        if ext == ".pdf":
+            return PyMuPDFLoader(file_path, extract_tables="markdown", mode="page")
+        elif ext == ".docx":
+            return Docx2txtLoader(file_path)
+        elif ext in [".txt", ".md"]:
+            return TextLoader(file_path, encoding="utf-8")
+        else:
+            raise ValueError(
+                f"Định dạng file không được hỗ trợ: {ext}. Chỉ hỗ trợ PDF, DOCX, TXT, MD"
+            )
+
+    except FileNotFoundError as e:
+        raise FileNotFoundError(f"Lỗi file không tồn tại: {str(e)}")
+    except PermissionError as e:
+        raise PermissionError(f"Lỗi quyền truy cập: {str(e)}")
+    except Exception as e:
+        raise Exception(f"Lỗi khi tạo loader cho file {file_path}: {str(e)}")
 
 
 # Hàm xử lý một tài liệu đơn lẻ với metadata chi tiết
 def ingest_document(file_path, config=None):
-    if config is None:
-        config = DEFAULT_CONFIG.copy()
+    try:
+        if config is None:
+            config = DEFAULT_CONFIG.copy()
 
-    filename = os.path.basename(file_path)
-    loader = get_loader(file_path)
-    documents = loader.load()
+        # Validate config
+        if not isinstance(config, dict):
+            raise TypeError("Config phải là dictionary")
 
-    # Cải thiện metadata cho mỗi document
-    for doc in documents:
-        doc.metadata.update(
-            {
-                "source_file": filename,
-                "file_path": file_path,
-                "file_type": os.path.splitext(filename)[1].lower(),
-                "processed_time": str(os.path.getmtime(file_path)),
-            }
-        )
+        required_keys = ["chunk_size", "chunk_overlap"]
+        for key in required_keys:
+            if key not in config:
+                raise KeyError(f"Config thiếu key bắt buộc: {key}")
+            if not isinstance(config[key], int) or config[key] <= 0:
+                raise ValueError(f"Config {key} phải là số nguyên dương")
 
-        # Thêm page number nếu có (cộng thêm 1 để bắt đầu từ trang 1)
-        if "page" in doc.metadata:
-            page_info = doc.metadata.get("page")
-            if page_info is not None and isinstance(page_info, (int, float)):
-                doc.metadata["page_number"] = int(page_info) + 1
-            else:
-                doc.metadata["page_number"] = page_info
-        else:
-            # Không có thông tin trang
-            doc.metadata["page_number"] = "N/A"
+        filename = os.path.basename(file_path)
 
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=config["chunk_size"],
-        chunk_overlap=config["chunk_overlap"],
-        length_function=len,
-        separators=config.get("separators", ["\n\n", "\n", " ", ""]),
-    )
-    chunks = text_splitter.split_documents(documents)
+        # Sử dụng get_loader đã được cải thiện với exception handling
+        try:
+            loader = get_loader(file_path)
+            documents = loader.load()
+        except Exception as e:
+            raise Exception(f"Lỗi khi tải tài liệu {filename}: {str(e)}")
 
-    # Thêm thông tin chunk index cho mỗi chunk
-    for i, chunk in enumerate(chunks):
-        chunk.metadata.update(
-            {
-                "chunk_index": i,
-                "chunk_size": len(chunk.page_content),
-                "total_chunks": len(chunks),
-            }
-        )
+        # Kiểm tra nội dung tài liệu
+        if not documents:
+            raise ValueError(
+                f"Tài liệu {filename} không có nội dung hoặc không thể đọc được"
+            )
 
-    return chunks
+        # Cải thiện metadata cho mỗi document
+        try:
+            for doc in documents:
+                if not hasattr(doc, "metadata"):
+                    doc.metadata = {}
+
+                doc.metadata.update(
+                    {
+                        "source_file": filename,
+                        "file_path": file_path,
+                        "file_type": os.path.splitext(filename)[1].lower(),
+                        "processed_time": str(os.path.getmtime(file_path)),
+                    }
+                )
+
+                # Thêm page number nếu có (cộng thêm 1 để bắt đầu từ trang 1)
+                if "page" in doc.metadata:
+                    page_info = doc.metadata.get("page")
+                    if page_info is not None and isinstance(page_info, (int, float)):
+                        doc.metadata["page_number"] = int(page_info) + 1
+                    else:
+                        doc.metadata["page_number"] = page_info
+                else:
+                    # Không có thông tin trang
+                    doc.metadata["page_number"] = "N/A"
+        except Exception as e:
+            raise Exception(f"Lỗi khi xử lý metadata cho tài liệu {filename}: {str(e)}")
+
+        # Xử lý text splitting
+        try:
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=config["chunk_size"],
+                chunk_overlap=config["chunk_overlap"],
+                length_function=len,
+                separators=config.get("separators", ["\n\n", "\n", " ", ""]),
+            )
+            chunks = text_splitter.split_documents(documents)
+        except Exception as e:
+            raise Exception(f"Lỗi khi chia nhỏ tài liệu {filename}: {str(e)}")
+
+        # Kiểm tra kết quả splitting
+        if not chunks:
+            raise ValueError(f"Không thể tạo chunks từ tài liệu {filename}")
+
+        # Thêm thông tin chunk index cho mỗi chunk
+        try:
+            for i, chunk in enumerate(chunks):
+                if not hasattr(chunk, "metadata"):
+                    chunk.metadata = {}
+
+                chunk.metadata.update(
+                    {
+                        "chunk_index": i,
+                        "chunk_size": len(chunk.page_content),
+                        "total_chunks": len(chunks),
+                    }
+                )
+        except Exception as e:
+            raise Exception(
+                f"Lỗi khi thêm metadata cho chunks của tài liệu {filename}: {str(e)}"
+            )
+
+        return chunks
+
+    except (FileNotFoundError, PermissionError, ValueError, KeyError, TypeError) as e:
+        # Re-raise specific exceptions với thông báo gốc
+        raise e
+    except Exception as e:
+        raise Exception(f"Lỗi không xác định khi xử lý tài liệu {file_path}: {str(e)}")
 
 
 # Hàm xây dựng hoặc xây dựng lại index với cấu hình chunking
 def build_index(config=None):
-    if config is None:
-        config = DEFAULT_CONFIG.copy()
+    try:
+        # Validate và setup config
+        if config is None:
+            config = DEFAULT_CONFIG.copy()
 
-    if os.path.exists(INDEX_DIR):
-        shutil.rmtree(INDEX_DIR)
+        if not isinstance(config, dict):
+            raise TypeError("Config phải là dictionary")
 
-    all_chunks = []
-    processed_files = []
+        # Validate required config keys
+        required_keys = ["chunk_size", "chunk_overlap"]
+        for key in required_keys:
+            if key not in config:
+                raise KeyError(f"Config thiếu key bắt buộc: {key}")
+            if not isinstance(config[key], int) or config[key] <= 0:
+                raise ValueError(f"Config {key} phải là số nguyên dương")
 
-    for filename in os.listdir(DOCUMENTS_DIR):
-        if filename.startswith("."):  # Bỏ qua hidden files
-            continue
+        # Kiểm tra thư mục documents tồn tại
+        if not os.path.exists(DOCUMENTS_DIR):
+            raise FileNotFoundError(f"Thư mục documents không tồn tại: {DOCUMENTS_DIR}")
 
-        file_path = os.path.join(DOCUMENTS_DIR, filename)
-        if os.path.isfile(file_path):
+        # Xóa index cũ nếu có
+        try:
+            if os.path.exists(INDEX_DIR):
+                shutil.rmtree(INDEX_DIR)
+        except PermissionError:
+            raise PermissionError(f"Không có quyền xóa thư mục index: {INDEX_DIR}")
+        except Exception as e:
+            raise Exception(f"Lỗi khi xóa index cũ: {str(e)}")
+
+        # Tạo lại thư mục index
+        try:
+            os.makedirs(INDEX_DIR, exist_ok=True)
+        except Exception as e:
+            raise Exception(f"Lỗi khi tạo thư mục index: {str(e)}")
+
+        all_chunks = []
+        processed_files = []
+        error_files = []
+
+        # Lấy danh sách files
+        try:
+            file_list = os.listdir(DOCUMENTS_DIR)
+        except PermissionError:
+            raise PermissionError(f"Không có quyền đọc thư mục: {DOCUMENTS_DIR}")
+        except Exception as e:
+            raise Exception(f"Lỗi khi đọc thư mục documents: {str(e)}")
+
+        # Xử lý từng file
+        for filename in file_list:
+            if filename.startswith("."):  # Bỏ qua hidden files
+                continue
+
+            file_path = os.path.join(DOCUMENTS_DIR, filename)
+
+            # Chỉ xử lý files, không phải directories
+            if not os.path.isfile(file_path):
+                continue
+
             try:
                 chunks = ingest_document(file_path, config)
                 all_chunks.extend(chunks)
-                processed_files.append(f"{filename}: {len(chunks)} chunks")
+                processed_files.append(f"✅ {filename}: {len(chunks)} chunks")
             except Exception as e:
-                processed_files.append(f"{filename}: Error - {str(e)}")
+                error_message = f"❌ {filename}: {str(e)}"
+                error_files.append(error_message)
+                processed_files.append(error_message)
 
-    if all_chunks:
-        embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-        vectorstore = FAISS.from_documents(all_chunks, embeddings)
-        vectorstore.save_local(INDEX_DIR)
+        # Kiểm tra có documents để index không
+        if not all_chunks:
+            if error_files:
+                error_summary = "\n".join(error_files)
+                return (
+                    f"Không thể tạo index - tất cả files đều gặp lỗi:\n{error_summary}"
+                )
+            else:
+                return "Không có tài liệu hợp lệ để tạo index."
 
-        result = f"Index built successfully with {len(all_chunks)} total chunks.\n"
-        result += f"Chunking strategy: {config['strategy']}, "
-        result += f"Chunk size: {config['chunk_size']}, "
-        result += f"Overlap: {config['chunk_overlap']}\n\n"
-        result += "Processed files:\n" + "\n".join(processed_files)
+        # Tạo embeddings và vectorstore
+        try:
+            embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+        except Exception as e:
+            raise Exception(
+                f"Lỗi khi tạo OpenAI embeddings: {str(e)}. Kiểm tra API key và kết nối mạng."
+            )
+
+        try:
+            vectorstore = FAISS.from_documents(all_chunks, embeddings)
+        except Exception as e:
+            raise Exception(f"Lỗi khi tạo FAISS vectorstore: {str(e)}")
+
+        try:
+            vectorstore.save_local(INDEX_DIR)
+        except PermissionError:
+            raise PermissionError(f"Không có quyền ghi vào thư mục index: {INDEX_DIR}")
+        except Exception as e:
+            raise Exception(f"Lỗi khi lưu vectorstore: {str(e)}")
+
+        # Tạo kết quả thành công
+        success_count = len(processed_files) - len(error_files)
+        result = f"🎉 Index được tạo thành công!\n"
+        result += f"📊 Tổng số chunks: {len(all_chunks)}\n"
+        result += f"📁 Files xử lý thành công: {success_count}/{len(processed_files)}\n"
+        result += f"⚙️ Cấu hình chunking: Kích thước {config['chunk_size']}, Overlap {config['chunk_overlap']}\n\n"
+
+        if error_files:
+            result += f"⚠️ {len(error_files)} file(s) gặp lỗi:\n"
+
+        result += "📋 Chi tiết xử lý:\n" + "\n".join(processed_files)
         return result
-    else:
-        return "No documents to index."
+
+    except (TypeError, KeyError, ValueError, FileNotFoundError, PermissionError) as e:
+        return f"Lỗi khi tạo index: {str(e)}"
+    except Exception as e:
+        return f"Lỗi không xác định khi tạo index: {str(e)}"
 
 
 # Hàm tải vectorstore
 def load_vectorstore():
-    if os.path.exists(os.path.join(INDEX_DIR, "index.faiss")):
-        embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-        return FAISS.load_local(
-            INDEX_DIR, embeddings, allow_dangerous_deserialization=True
-        )
-    return None
+    try:
+        # Kiểm tra thư mục index tồn tại
+        if not os.path.exists(INDEX_DIR):
+            raise FileNotFoundError(f"Thư mục index không tồn tại: {INDEX_DIR}")
+
+        # Kiểm tra file index.faiss tồn tại
+        index_file = os.path.join(INDEX_DIR, "index.faiss")
+        if not os.path.exists(index_file):
+            return None  # Không có index, trả về None (không phải lỗi)
+
+        # Kiểm tra file index.pkl tồn tại
+        pkl_file = os.path.join(INDEX_DIR, "index.pkl")
+        if not os.path.exists(pkl_file):
+            raise FileNotFoundError(f"File index.pkl không tồn tại: {pkl_file}")
+
+        try:
+            # Tạo embeddings
+            embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+        except Exception as e:
+            raise Exception(
+                f"Lỗi khi tạo OpenAI embeddings: {str(e)}. Kiểm tra API key và kết nối mạng."
+            )
+
+        try:
+            # Tải vectorstore
+            vectorstore = FAISS.load_local(
+                INDEX_DIR, embeddings, allow_dangerous_deserialization=True
+            )
+            return vectorstore
+        except Exception as e:
+            raise Exception(f"Lỗi khi tải vectorstore từ {INDEX_DIR}: {str(e)}")
+
+    except FileNotFoundError as e:
+        raise FileNotFoundError(str(e))
+    except Exception as e:
+        raise Exception(f"Lỗi không xác định khi tải vectorstore: {str(e)}")
 
 
 # Hàm tải lên và xử lý file
 def upload_file(file):
-    if file is None:
-        return "No file uploaded."
+    try:
+        # Kiểm tra file có được tải lên
+        if file is None:
+            return "Không có file nào được tải lên."
 
-    filename = os.path.basename(file.name)
-    file_path = os.path.join(DOCUMENTS_DIR, filename)
-    shutil.copy(file.name, file_path)
+        # Kiểm tra file object có name attribute
+        if not hasattr(file, "name") or not file.name:
+            return "File không hợp lệ hoặc thiếu thông tin tên file."
 
-    config = DEFAULT_CONFIG.copy()
-    result = build_index(config)  # Rebuild index sau khi tải lên
-    return f"File {filename} uploaded successfully.\n\n{result}"
+        # Kiểm tra file có tồn tại trong temp location
+        if not os.path.exists(file.name):
+            return "File tạm thời không tồn tại. Vui lòng thử tải lên lại."
+
+        filename = os.path.basename(file.name)
+
+        # Validate filename
+        if not filename or filename.startswith("."):
+            return "Tên file không hợp lệ."
+
+        # Kiểm tra định dạng file được hỗ trợ
+        ext = os.path.splitext(filename)[1].lower()
+        supported_extensions = [".pdf", ".docx", ".txt", ".md"]
+        if ext not in supported_extensions:
+            return f"Định dạng file {ext} không được hỗ trợ. Chỉ hỗ trợ: {', '.join(supported_extensions)}"
+
+        # Kiểm tra kích thước file (giới hạn 100MB)
+        file_size = os.path.getsize(file.name)
+        max_size = 100 * 1024 * 1024  # 100MB
+        if file_size > max_size:
+            return f"File quá lớn ({file_size / (1024*1024):.1f} MB). Giới hạn tối đa là 100MB."
+
+        file_path = os.path.join(DOCUMENTS_DIR, filename)
+
+        # Kiểm tra file đã tồn tại
+        if os.path.exists(file_path):
+            return (
+                f"File {filename} đã tồn tại. Vui lòng xóa file cũ hoặc đổi tên file."
+            )
+
+        try:
+            # Copy file đến thư mục documents
+            shutil.copy(file.name, file_path)
+        except PermissionError:
+            return f"Không có quyền ghi file vào thư mục {DOCUMENTS_DIR}."
+        except shutil.Error as e:
+            return f"Lỗi khi copy file: {str(e)}"
+        except Exception as e:
+            return f"Lỗi không xác định khi lưu file: {str(e)}"
+
+        # Rebuild index sau khi tải lên
+        try:
+            config = DEFAULT_CONFIG.copy()
+            result = build_index(config)
+            return f"File {filename} đã được tải lên thành công.\n\n{result}"
+        except Exception as e:
+            # Nếu build index thất bại, xóa file đã upload để tránh inconsistency
+            try:
+                os.remove(file_path)
+            except:
+                pass
+            return f"File {filename} đã được tải lên nhưng gặp lỗi khi đánh index: {str(e)}"
+
+    except Exception as e:
+        return f"Lỗi không xác định khi tải lên file: {str(e)}"
 
 
 # Hàm liệt kê các tài liệu với thông tin chi tiết
@@ -180,13 +416,48 @@ def list_documents():
 
 # Hàm xóa tài liệu
 def delete_document(filename):
-    file_path = os.path.join(DOCUMENTS_DIR, filename)
-    if os.path.exists(file_path):
-        os.remove(file_path)
-        config = DEFAULT_CONFIG.copy()
-        result = build_index(config)  # Rebuild index sau khi xóa
-        return f"File {filename} deleted successfully.\n\n{result}"
-    return "File not found."
+    try:
+        # Validate filename
+        if not filename or not isinstance(filename, str):
+            return "Tên file không hợp lệ."
+
+        # Sanitize filename để tránh path traversal
+        filename = os.path.basename(filename.strip())
+        if not filename or filename.startswith(".") or filename == "..":
+            return "Tên file không hợp lệ hoặc không an toàn."
+
+        file_path = os.path.join(DOCUMENTS_DIR, filename)
+
+        # Đảm bảo file path nằm trong DOCUMENTS_DIR (security check)
+        if not os.path.abspath(file_path).startswith(os.path.abspath(DOCUMENTS_DIR)):
+            return "Đường dẫn file không hợp lệ."
+
+        # Kiểm tra file có tồn tại
+        if not os.path.exists(file_path):
+            return f"Không tìm thấy file: {filename}"
+
+        # Kiểm tra đây có phải là file không (không phải thư mục)
+        if not os.path.isfile(file_path):
+            return f"{filename} không phải là file hợp lệ."
+
+        try:
+            # Xóa file
+            os.remove(file_path)
+        except PermissionError:
+            return f"Không có quyền xóa file: {filename}"
+        except Exception as e:
+            return f"Lỗi khi xóa file {filename}: {str(e)}"
+
+        # Rebuild index sau khi xóa
+        try:
+            config = DEFAULT_CONFIG.copy()
+            result = build_index(config)
+            return f"File {filename} đã được xóa thành công.\n\n{result}"
+        except Exception as e:
+            return f"File {filename} đã được xóa nhưng gặp lỗi khi cập nhật index: {str(e)}"
+
+    except Exception as e:
+        return f"Lỗi không xác định khi xóa file: {str(e)}"
 
 
 # Hàm đánh index lại với cấu hình hiện tại
@@ -202,22 +473,21 @@ Sử dụng CHÍNH XÁC thông tin từ các đoạn văn bản dưới đây đ
 Nếu bạn không biết câu trả lời từ ngữ cảnh đã cho, hãy nói rằng bạn không biết, đừng bịa đặt thông tin.
 Sử dụng ngôn ngữ tự nhiên, thân thiện với người dùng.
 Trả lời bằng cùng ngôn ngữ với câu hỏi (Tiếng Việt hoặc Tiếng Anh).
-Khi câu hỏi bằng tiếng Anh nhưng context bằng tiếng Việt, hãy hiểu context tiếng Việt, trích xuất thông tin liên quan, và soạn câu trả lời hoàn chỉnh bằng tiếng Anh. Ngược lại Tiếng Anh cũng vậy.
 
 QUY TẮC TRÍCH DẪN BẮT BUỘC:
 - BẮT BUỘC phải trích dẫn nguồn cho MỖI thông tin bạn cung cấp
-- SỬ DỤNG CHÍNH XÁC citation đã được cung cấp trong từng đoạn văn bản
-- Mỗi đoạn văn bản đã có sẵn "Nguồn trích dẫn:" ở cuối - PHẢI sử dụng đúng citation này
-- KHÔNG được tự tạo citation mới, chỉ sử dụng citation có sẵn trong ngữ cảnh
-- Khi tham khảo thông tin từ một đoạn văn bản, LUÔN include citation của đoạn đó
-- Nếu thông tin đến từ nhiều đoạn văn bản, liệt kê TẤT CẢ citations liên quan
+- SỬ DỤNG CHÍNH XÁC trích dẫn đã được cung cấp trong từng đoạn văn bản
+- Mỗi đoạn văn bản đã có sẵn "Nguồn trích dẫn:" ở cuối - PHẢI sử dụng đúng trích dẫn này
+- KHÔNG được tự tạo trích dẫn mới, chỉ sử dụng trích dẫn có sẵn trong ngữ cảnh
+- Khi tham khảo thông tin từ một đoạn văn bản, LUÔN include trích dẫn của đoạn đó
+- Nếu thông tin đến từ nhiều đoạn văn bản, liệt kê TẤT CẢ trích dẫn liên quan
 
 CÁCH TRÍCH DẪN:
 - Sau mỗi thông tin, thêm citation trong ngoặc vuông
 - Ví dụ: "Doanh thu năm 2023 là 100 triệu đồng [bao_cao_tai_chinh.pdf, Trang 5]"
 - Với nhiều nguồn: "Thông tin này được xác nhận [file1.pdf, Trang 2] [file2.pdf, Trang 7]"
 
-Ngữ cảnh với citation:
+Ngữ cảnh với trích dẫn:
 {context}
 
 Câu hỏi: {question}
@@ -263,36 +533,88 @@ def format_docs_with_metadata(docs):
 
 # Hàm cho hỏi đáp với citation chính xác
 def ask_question(question, num_results=5):
-    vectorstore = load_vectorstore()
-    if vectorstore is None:
-        return "Không có index nào khả dụng. Vui lòng tải lên tài liệu trước."
+    try:
+        # Validate input parameters
+        if not question or not isinstance(question, str):
+            return "Câu hỏi không hợp lệ. Vui lòng nhập một câu hỏi."
 
-    # Tạo LLM
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        question = question.strip()
+        if not question:
+            return "Câu hỏi không thể để trống."
 
-    # Tạo retriever
-    retriever = vectorstore.as_retriever(search_kwargs={"k": num_results})
+        if len(question) > 1000:
+            return "Câu hỏi quá dài (tối đa 1000 ký tự). Vui lòng rút gọn câu hỏi."
 
-    # Retrieve documents
-    relevant_docs = retriever.get_relevant_documents(question)
+        # Validate num_results
+        if not isinstance(num_results, int) or num_results < 1 or num_results > 20:
+            num_results = 5  # Set default value if invalid
 
-    if not relevant_docs:
-        return "Không tìm thấy thông tin liên quan trong tài liệu."
+        # Tải vectorstore
+        try:
+            vectorstore = load_vectorstore()
+        except Exception as e:
+            return f"Lỗi khi tải vectorstore: {str(e)}"
 
-    # Format context với metadata chi tiết
-    formatted_context = format_docs_with_metadata(relevant_docs)
+        if vectorstore is None:
+            return "Không có index nào khả dụng. Vui lòng tải lên tài liệu và tạo index trước."
 
-    # Tạo prompt với context đã được format
-    formatted_prompt = PROMPT.format(context=formatted_context, question=question)
+        # Tạo LLM
+        try:
+            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        except Exception as e:
+            return (
+                f"Lỗi khi tạo ChatOpenAI: {str(e)}. Kiểm tra API key và kết nối mạng."
+            )
 
-    # Gọi LLM với prompt đã format
-    result = llm.invoke(formatted_prompt)
+        # Tạo retriever và search documents
+        try:
+            retriever = vectorstore.as_retriever(search_kwargs={"k": num_results})
+            relevant_docs = retriever.get_relevant_documents(question)
+        except Exception as e:
+            return f"Lỗi khi tìm kiếm tài liệu liên quan: {str(e)}"
 
-    # Trả về nội dung text từ response
-    if hasattr(result, "content"):
-        return result.content
-    else:
-        return str(result)
+        # Kiểm tra có tài liệu liên quan không
+        if not relevant_docs:
+            return "Không tìm thấy thông tin liên quan trong tài liệu. Hãy thử câu hỏi khác hoặc kiểm tra lại từ khóa."
+
+        # Format context với metadata chi tiết
+        try:
+            formatted_context = format_docs_with_metadata(relevant_docs)
+        except Exception as e:
+            return f"Lỗi khi format context: {str(e)}"
+
+        # Tạo prompt với context đã được format
+        try:
+            formatted_prompt = PROMPT.format(
+                context=formatted_context, question=question
+            )
+        except Exception as e:
+            return f"Lỗi khi tạo prompt: {str(e)}"
+
+        # Gọi LLM với prompt đã format
+        try:
+            result = llm.invoke(formatted_prompt)
+        except Exception as e:
+            return f"Lỗi khi gọi OpenAI API: {str(e)}. Kiểm tra API key, quota và kết nối mạng."
+
+        # Trả về nội dung text từ response
+        try:
+            if hasattr(result, "content"):
+                response_content = result.content
+            else:
+                response_content = str(result)
+
+            # Kiểm tra response không trống
+            if not response_content or not response_content.strip():
+                return "LLM không trả lời được câu hỏi. Hãy thử câu hỏi khác."
+
+            return response_content.strip()
+
+        except Exception as e:
+            return f"Lỗi khi xử lý response từ LLM: {str(e)}"
+
+    except Exception as e:
+        return f"Lỗi không xác định khi xử lý câu hỏi: {str(e)}"
 
 
 # Giao diện Gradio
