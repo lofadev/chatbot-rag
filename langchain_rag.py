@@ -1,15 +1,15 @@
 import os
 import shutil
 import gradio as gr
-from docling.document_converter import DocumentConverter
-from haystack import Pipeline, Document
-from haystack.components.preprocessors import DocumentSplitter
-from haystack.components.embedders import OpenAIDocumentEmbedder, OpenAITextEmbedder
-from haystack_integrations.document_stores.qdrant import QdrantDocumentStore
-from haystack.components.writers import DocumentWriter
-from haystack.components.builders import PromptBuilder
-from haystack.components.generators import OpenAIGenerator
-from haystack_integrations.components.retrievers.qdrant import QdrantEmbeddingRetriever
+from langchain_community.document_loaders import (
+    PyMuPDFLoader,
+    Docx2txtLoader,
+    TextLoader,
+)
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_core.prompts import PromptTemplate
 from dotenv import load_dotenv
 
 # Tải các biến môi trường (cho OpenAI API key)
@@ -17,7 +17,7 @@ load_dotenv()
 
 # Các thư mục
 DOCUMENTS_DIR = "documents"
-INDEX_DIR = "qdrant_index"  # Changed to Qdrant persistent path
+INDEX_DIR = "faiss_index"
 
 # Đảm bảo các thư mục tồn tại
 os.makedirs(DOCUMENTS_DIR, exist_ok=True)
@@ -27,18 +27,45 @@ os.makedirs(INDEX_DIR, exist_ok=True)
 DEFAULT_CONFIG = {
     "chunk_size": 1000,
     "chunk_overlap": 200,
-    "strategy": "recursive",  # Not directly used in Haystack, but approximated with splitter
-    "separators": [
-        "\n\n",
-        "\n",
-        " ",
-        "",
-    ],  # Haystack splitter uses split_by, we'll use "word" or "sentence"
+    "strategy": "recursive",  # "recursive", "character", "token"
+    "separators": ["\n\n", "\n", " ", ""],
     "length_function": "len",
 }
 
 
-# Hàm xử lý một tài liệu đơn lẻ với metadata chi tiết sử dụng Docling và Haystack
+# Hàm lấy loader phù hợp dựa trên phần mở rộng của file
+def get_loader(file_path):
+    try:
+        # Kiểm tra file tồn tại
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Không tìm thấy file: {file_path}")
+
+        # Kiểm tra file có thể đọc được
+        if not os.access(file_path, os.R_OK):
+            raise PermissionError(f"Không có quyền đọc file: {file_path}")
+
+        ext = os.path.splitext(file_path)[1].lower()
+
+        if ext == ".pdf":
+            return PyMuPDFLoader(file_path, extract_tables="markdown", mode="page")
+        elif ext == ".docx":
+            return Docx2txtLoader(file_path)
+        elif ext in [".txt", ".md"]:
+            return TextLoader(file_path, encoding="utf-8")
+        else:
+            raise ValueError(
+                f"Định dạng file không được hỗ trợ: {ext}. Chỉ hỗ trợ PDF, DOCX, TXT, MD"
+            )
+
+    except FileNotFoundError as e:
+        raise FileNotFoundError(f"Lỗi file không tồn tại: {str(e)}")
+    except PermissionError as e:
+        raise PermissionError(f"Lỗi quyền truy cập: {str(e)}")
+    except Exception as e:
+        raise Exception(f"Lỗi khi tạo loader cho file {file_path}: {str(e)}")
+
+
+# Hàm xử lý một tài liệu đơn lẻ với metadata chi tiết
 def ingest_document(file_path, config=None):
     try:
         if config is None:
@@ -57,70 +84,57 @@ def ingest_document(file_path, config=None):
 
         filename = os.path.basename(file_path)
 
-        # Sử dụng DocumentConverter từ Docling
+        # Sử dụng get_loader đã được cải thiện với exception handling
         try:
-            converter = DocumentConverter()
-            result = converter.convert(file_path)
-            doc = result.document
+            loader = get_loader(file_path)
+            documents = loader.load()
+            print(documents[2].page_content)
         except Exception as e:
             raise Exception(f"Lỗi khi tải tài liệu {filename}: {str(e)}")
 
         # Kiểm tra nội dung tài liệu
-        if not doc:
-            raise ValueError(
-                f"Tài liệu {filename} không có nội dung hoặc không thể đọc được"
-            )
-
-        ext = os.path.splitext(filename)[1].lower()
-        processed_time = str(os.path.getmtime(file_path))
-
-        # Tạo Haystack Documents với page info nếu có
-        documents = []
-        if doc.pages:  # Nếu có pages (thường cho PDF)
-            for page_no in sorted(doc.pages.keys()):
-                try:
-                    content = doc.export_to_markdown(page_no=page_no)
-                except Exception as e:
-                    content = ""  # Nếu lỗi, bỏ qua hoặc xử lý
-                meta = {
-                    "source_file": filename,
-                    "file_path": file_path,
-                    "file_type": ext,
-                    "processed_time": processed_time,
-                    "page_number": page_no,  # Giả sử page_no bắt đầu từ 1
-                }
-                if content.strip():  # Chỉ thêm nếu có nội dung
-                    documents.append(Document(content=content, meta=meta))
-        else:  # Cho non-PDF như TXT, DOCX
-            content = doc.export_to_markdown()
-            meta = {
-                "source_file": filename,
-                "file_path": file_path,
-                "file_type": ext,
-                "processed_time": processed_time,
-                "page_number": "N/A",
-            }
-            documents.append(Document(content=content, meta=meta))
-
-        # Kiểm tra documents
         if not documents:
             raise ValueError(
                 f"Tài liệu {filename} không có nội dung hoặc không thể đọc được"
             )
 
-        # Xử lý text splitting với Haystack DocumentSplitter
+        # Cải thiện metadata cho mỗi document
         try:
-            # Approximate recursive splitting với split_by="sentence" hoặc "word"
-            text_splitter = DocumentSplitter(
-                split_by="sentence",  # Hoặc "word" để approximate
-                split_length=config["chunk_size"]
-                // 20,  # Adjust vì sentence, chunk_size gốc là char
-                split_overlap=config["chunk_overlap"] // 20,
+            for doc in documents:
+                if not hasattr(doc, "metadata"):
+                    doc.metadata = {}
+
+                doc.metadata.update(
+                    {
+                        "source_file": filename,
+                        "file_path": file_path,
+                        "file_type": os.path.splitext(filename)[1].lower(),
+                        "processed_time": str(os.path.getmtime(file_path)),
+                    }
+                )
+
+                # Thêm page number nếu có (cộng thêm 1 để bắt đầu từ trang 1)
+                if "page" in doc.metadata:
+                    page_info = doc.metadata.get("page")
+                    if page_info is not None and isinstance(page_info, (int, float)):
+                        doc.metadata["page_number"] = int(page_info) + 1
+                    else:
+                        doc.metadata["page_number"] = page_info
+                else:
+                    # Không có thông tin trang
+                    doc.metadata["page_number"] = "N/A"
+        except Exception as e:
+            raise Exception(f"Lỗi khi xử lý metadata cho tài liệu {filename}: {str(e)}")
+
+        # Xử lý text splitting
+        try:
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=config["chunk_size"],
+                chunk_overlap=config["chunk_overlap"],
+                length_function=len,
+                separators=config.get("separators", ["\n\n", "\n", " ", ""]),
             )
-            splitter_pipe = Pipeline()
-            splitter_pipe.add_component("splitter", text_splitter)
-            result = splitter_pipe.run({"documents": documents})
-            chunks = result["splitter"]["documents"]
+            chunks = text_splitter.split_documents(documents)
         except Exception as e:
             raise Exception(f"Lỗi khi chia nhỏ tài liệu {filename}: {str(e)}")
 
@@ -131,10 +145,13 @@ def ingest_document(file_path, config=None):
         # Thêm thông tin chunk index cho mỗi chunk
         try:
             for i, chunk in enumerate(chunks):
-                chunk.meta.update(
+                if not hasattr(chunk, "metadata"):
+                    chunk.metadata = {}
+
+                chunk.metadata.update(
                     {
                         "chunk_index": i,
-                        "chunk_size": len(chunk.content),
+                        "chunk_size": len(chunk.page_content),
                         "total_chunks": len(chunks),
                     }
                 )
@@ -152,10 +169,7 @@ def ingest_document(file_path, config=None):
         raise Exception(f"Lỗi không xác định khi xử lý tài liệu {file_path}: {str(e)}")
 
 
-# Các hàm còn lại giữ nguyên, chỉ xóa get_parser vì không cần nữa
-
-
-# Hàm xây dựng hoặc xây dựng lại index với Qdrant và Haystack
+# Hàm xây dựng hoặc xây dựng lại index với cấu hình chunking
 def build_index(config=None):
     try:
         # Validate và setup config
@@ -177,7 +191,7 @@ def build_index(config=None):
         if not os.path.exists(DOCUMENTS_DIR):
             raise FileNotFoundError(f"Thư mục documents không tồn tại: {DOCUMENTS_DIR}")
 
-        # Xóa index cũ nếu có (Qdrant local path)
+        # Xóa index cũ nếu có
         try:
             if os.path.exists(INDEX_DIR):
                 shutil.rmtree(INDEX_DIR)
@@ -186,15 +200,11 @@ def build_index(config=None):
         except Exception as e:
             raise Exception(f"Lỗi khi xóa index cũ: {str(e)}")
 
-        # Tạo QdrantDocumentStore mới
+        # Tạo lại thư mục index
         try:
-            store = QdrantDocumentStore(
-                path=INDEX_DIR,  # Persistent local path
-                index="documents",
-                embedding_dim=1536,  # Dimension for text-embedding-3-small
-            )
+            os.makedirs(INDEX_DIR, exist_ok=True)
         except Exception as e:
-            raise Exception(f"Lỗi khi tạo QdrantDocumentStore: {str(e)}")
+            raise Exception(f"Lỗi khi tạo thư mục index: {str(e)}")
 
         all_chunks = []
         processed_files = []
@@ -222,7 +232,7 @@ def build_index(config=None):
             try:
                 chunks = ingest_document(file_path, config)
                 all_chunks.extend(chunks)
-                processed_files.append(f"✅ {filename}: {len(chunks)} chunks")
+                processed_files.append(f"{filename}: {len(chunks)} chunks")
             except Exception as e:
                 error_message = f"❌ {filename}: {str(e)}"
                 error_files.append(error_message)
@@ -238,17 +248,25 @@ def build_index(config=None):
             else:
                 return "Không có tài liệu hợp lệ để tạo index."
 
-        # Tạo indexing pipeline với Haystack
+        # Tạo embeddings và vectorstore
         try:
-            indexing_pipe = Pipeline()
-            indexing_pipe.add_component(
-                "embedder", OpenAIDocumentEmbedder(model="text-embedding-3-small")
-            )
-            indexing_pipe.add_component("writer", DocumentWriter(document_store=store))
-            indexing_pipe.connect("embedder", "writer")
-            indexing_pipe.run({"embedder": {"documents": all_chunks}})
+            embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
         except Exception as e:
-            raise Exception(f"Lỗi khi indexing documents vào Qdrant: {str(e)}")
+            raise Exception(
+                f"Lỗi khi tạo OpenAI embeddings: {str(e)}. Kiểm tra API key và kết nối mạng."
+            )
+
+        try:
+            vectorstore = FAISS.from_documents(all_chunks, embeddings)
+        except Exception as e:
+            raise Exception(f"Lỗi khi tạo FAISS vectorstore: {str(e)}")
+
+        try:
+            vectorstore.save_local(INDEX_DIR)
+        except PermissionError:
+            raise PermissionError(f"Không có quyền ghi vào thư mục index: {INDEX_DIR}")
+        except Exception as e:
+            raise Exception(f"Lỗi khi lưu vectorstore: {str(e)}")
 
         # Tạo kết quả thành công
         success_count = len(processed_files) - len(error_files)
@@ -269,23 +287,42 @@ def build_index(config=None):
         return f"Lỗi không xác định khi tạo index: {str(e)}"
 
 
-# Hàm tải QdrantDocumentStore
+# Hàm tải vectorstore
 def load_vectorstore():
     try:
         # Kiểm tra thư mục index tồn tại
         if not os.path.exists(INDEX_DIR):
+            raise FileNotFoundError(f"Thư mục index không tồn tại: {INDEX_DIR}")
+
+        # Kiểm tra file index.faiss tồn tại
+        index_file = os.path.join(INDEX_DIR, "index.faiss")
+        if not os.path.exists(index_file):
             return None  # Không có index, trả về None (không phải lỗi)
 
-        try:
-            store = QdrantDocumentStore(
-                path=INDEX_DIR,
-                index="documents",
-                embedding_dim=1536,
-            )
-            return store
-        except Exception as e:
-            raise Exception(f"Lỗi khi tải QdrantDocumentStore từ {INDEX_DIR}: {str(e)}")
+        # Kiểm tra file index.pkl tồn tại
+        pkl_file = os.path.join(INDEX_DIR, "index.pkl")
+        if not os.path.exists(pkl_file):
+            raise FileNotFoundError(f"File index.pkl không tồn tại: {pkl_file}")
 
+        try:
+            # Tạo embeddings
+            embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+        except Exception as e:
+            raise Exception(
+                f"Lỗi khi tạo OpenAI embeddings: {str(e)}. Kiểm tra API key và kết nối mạng."
+            )
+
+        try:
+            # Tải vectorstore
+            vectorstore = FAISS.load_local(
+                INDEX_DIR, embeddings, allow_dangerous_deserialization=True
+            )
+            return vectorstore
+        except Exception as e:
+            raise Exception(f"Lỗi khi tải vectorstore từ {INDEX_DIR}: {str(e)}")
+
+    except FileNotFoundError as e:
+        raise FileNotFoundError(str(e))
     except Exception as e:
         raise Exception(f"Lỗi không xác định khi tải vectorstore: {str(e)}")
 
@@ -430,7 +467,7 @@ def reindex():
     return build_index(config)
 
 
-# Prompt tùy chỉnh cho LLM với hướng dẫn trích dẫn chi tiết (sử dụng Jinja2 cho Haystack PromptBuilder)
+# Prompt tùy chỉnh cho LLM với hướng dẫn trích dẫn chi tiết
 prompt_template = """
 Bạn là một trợ lý AI tìm kiếm thông tin thông minh, bạn có thể tìm kiếm thông tin trong các tài liệu đã được đánh index.
 Sử dụng CHÍNH XÁC thông tin từ các đoạn văn bản dưới đây để trả lời câu hỏi. 
@@ -452,20 +489,50 @@ CÁCH TRÍCH DẪN:
 - Với nhiều nguồn: "Thông tin này được xác nhận [file1.pdf, Trang 2] [file2.pdf, Trang 7]"
 
 Ngữ cảnh với trích dẫn:
-{% for doc in documents %}
-=== ĐOẠN VĂN BẢN TỪ [{{ doc.meta.source_file }}, Trang {{ doc.meta.page_number }}] ===
-{{ doc.content }}
-=== KẾT THÚC ĐOẠN VĂN BẢN ===
-Nguồn trích dẫn: [{{ doc.meta.source_file }}, Trang {{ doc.meta.page_number }}]
-{% endfor %}
+{context}
 
-Câu hỏi: {{ question }}
+Câu hỏi: {question}
 
 Trả lời chi tiết (BẮT BUỘC bao gồm trích dẫn nguồn cho mọi thông tin):
 """
 
+PROMPT = PromptTemplate(
+    template=prompt_template, input_variables=["context", "question"]
+)
 
-# Hàm cho hỏi đáp với citation chính xác sử dụng Haystack Pipeline
+
+# Hàm cải thiện context với metadata chi tiết - chỉ hiển thị file và trang
+def format_docs_with_metadata(docs):
+    formatted_docs = []
+    for doc in docs:
+        metadata = doc.metadata
+        source_file = metadata.get("source_file", "Unknown file")
+
+        # Xử lý số trang (ưu tiên page_number đã được xử lý, không thì xử lý page gốc)
+        if "page_number" in metadata and metadata["page_number"] != "N/A":
+            # page_number đã được xử lý trong ingest_document
+            display_page = metadata["page_number"]
+            citation = f"[{source_file}, Trang {display_page}]"
+        elif "page" in metadata and metadata["page"] != "N/A":
+            # Fallback: sử dụng page gốc và cộng thêm 1
+            page_info = metadata["page"]
+            if isinstance(page_info, (int, float)):
+                display_page = int(page_info) + 1
+            else:
+                display_page = page_info
+            citation = f"[{source_file}, Trang {display_page}]"
+        else:
+            # Không có thông tin trang, chỉ hiển thị file
+            citation = f"[{source_file}]"
+
+        # Format content với citation rõ ràng hơn - không hiển thị thông tin chunk
+        content = f"=== ĐOẠN VĂN BẢN TỪ {citation} ===\n{doc.page_content}\n=== KẾT THÚC ĐOẠN VĂN BẢN ===\nNguồn trích dẫn: {citation}"
+        formatted_docs.append(content)
+
+    return "\n\n---\n\n".join(formatted_docs)
+
+
+# Hàm cho hỏi đáp với citation chính xác
 def ask_question(question, num_results=5):
     try:
         # Validate input parameters
@@ -485,42 +552,58 @@ def ask_question(question, num_results=5):
 
         # Tải vectorstore
         try:
-            store = load_vectorstore()
+            vectorstore = load_vectorstore()
         except Exception as e:
             return f"Lỗi khi tải vectorstore: {str(e)}"
 
-        if store is None:
+        if vectorstore is None:
             return "Không có index nào khả dụng. Vui lòng tải lên tài liệu và tạo index trước."
 
-        # Tạo query pipeline với Haystack
+        # Tạo LLM
         try:
-            query_pipe = Pipeline()
-            query_pipe.add_component(
-                "embedder", OpenAITextEmbedder(model="text-embedding-3-small")
-            )
-            query_pipe.add_component(
-                "retriever",
-                QdrantEmbeddingRetriever(document_store=store, top_k=num_results),
-            )
-            query_pipe.add_component(
-                "prompt_builder", PromptBuilder(template=prompt_template)
-            )
-            query_pipe.add_component(
-                "generator", OpenAIGenerator(model="gpt-4o-mini", temperature=0)
+            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        except Exception as e:
+            return (
+                f"Lỗi khi tạo ChatOpenAI: {str(e)}. Kiểm tra API key và kết nối mạng."
             )
 
-            query_pipe.connect("embedder.embedding", "retriever.query_embedding")
-            query_pipe.connect("retriever.documents", "prompt_builder.documents")
-            query_pipe.connect("prompt_builder.prompt", "generator.prompt")
+        # Tạo retriever và search documents
+        try:
+            retriever = vectorstore.as_retriever(search_kwargs={"k": num_results})
+            relevant_docs = retriever.get_relevant_documents(question)
+        except Exception as e:
+            return f"Lỗi khi tìm kiếm tài liệu liên quan: {str(e)}"
 
-            result = query_pipe.run(
-                {
-                    "embedder": {"text": question},
-                    "prompt_builder": {"question": question},
-                }
+        # Kiểm tra có tài liệu liên quan không
+        if not relevant_docs:
+            return "Không tìm thấy thông tin liên quan trong tài liệu. Hãy thử câu hỏi khác hoặc kiểm tra lại từ khóa."
+
+        # Format context với metadata chi tiết
+        try:
+            formatted_context = format_docs_with_metadata(relevant_docs)
+        except Exception as e:
+            return f"Lỗi khi format context: {str(e)}"
+
+        # Tạo prompt với context đã được format
+        try:
+            formatted_prompt = PROMPT.format(
+                context=formatted_context, question=question
             )
+        except Exception as e:
+            return f"Lỗi khi tạo prompt: {str(e)}"
 
-            response_content = result["generator"]["replies"][0]
+        # Gọi LLM với prompt đã format
+        try:
+            result = llm.invoke(formatted_prompt)
+        except Exception as e:
+            return f"Lỗi khi gọi OpenAI API: {str(e)}. Kiểm tra API key, quota và kết nối mạng."
+
+        # Trả về nội dung text từ response
+        try:
+            if hasattr(result, "content"):
+                response_content = result.content
+            else:
+                response_content = str(result)
 
             # Kiểm tra response không trống
             if not response_content or not response_content.strip():
@@ -529,13 +612,13 @@ def ask_question(question, num_results=5):
             return response_content.strip()
 
         except Exception as e:
-            return f"Lỗi khi chạy query pipeline: {str(e)}"
+            return f"Lỗi khi xử lý response từ LLM: {str(e)}"
 
     except Exception as e:
         return f"Lỗi không xác định khi xử lý câu hỏi: {str(e)}"
 
 
-# Giao diện Gradio (giữ nguyên như gốc)
+# Giao diện Gradio
 with gr.Blocks(title="RAG Document QA System", theme=gr.themes.Default()) as demo:
     gr.Markdown("# 🤖 RAG-based Document QA System")
     gr.Markdown(
