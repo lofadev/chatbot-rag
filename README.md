@@ -48,34 +48,18 @@ chatbot-rag/
 
 ## 📋 Yêu cầu hệ thống
 
-- **Python**: 3.8 hoặc cao hơn
+- **Python**: 3.11
 - **RAM**: Tối thiểu 4GB (khuyến nghị 8GB+)
 - **Disk**: 2GB trống cho dependencies và indexes
 - **Internet**: Để truy cập OpenAI API
 
 ## 🚀 Cài đặt và Thiết lập
 
-### Cách 1: Setup tự động (Khuyến nghị)
-
-```bash
-# Clone repository (nếu từ git)
-git clone <repository-url>
-cd chatbot-rag
-
-# Chạy script setup tự động
-python setup.py
-
-# Hoặc sử dụng Makefile (Linux/macOS)
-make setup
-```
-
-### Cách 2: Setup thủ công
-
 #### Bước 1: Clone repository và tạo virtual environment
 
 ```bash
 # Clone repository (nếu từ git)
-git clone <repository-url>
+git clone https://github.com/lofadev/chatbot-rag.git
 cd chatbot-rag
 
 # Tạo virtual environment
@@ -94,23 +78,8 @@ source rag-env/bin/activate
 # Cập nhật pip
 pip install --upgrade pip
 
-# Cài đặt tất cả dependencies từ file requirements.txt
-pip install -r requirements.txt
-```
-
-**Hoặc cài đặt từng nhóm:**
-
-```bash
-# Dependencies chung
-pip install python-dotenv openai gradio
-
-# Cho Haystack implementation
-pip install haystack-ai docling
-pip install haystack-integrations[qdrant]
-
-# Cho LangChain implementation
-pip install langchain langchain-community langchain-openai langchain-text-splitters
-pip install faiss-cpu PyMuPDF docx2txt
+# Cài đặt tất cả dependencies từ file pyproject.toml
+pip install .
 ```
 
 ### Bước 3: Thiết lập OpenAI API Key
@@ -122,11 +91,7 @@ File `.env` đã được tạo từ template, chỉ cần chỉnh sửa.
 
 ```bash
 # Copy từ template
-cp env_template.txt .env
-
-# Hoặc tạo file .env mới
-touch .env  # macOS/Linux
-# Hoặc tạo file .env bằng editor trên Windows
+cp .env.example .env
 ```
 
 Chỉnh sửa file `.env` và thêm API key:
